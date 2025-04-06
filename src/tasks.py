@@ -71,7 +71,6 @@ def command(
         )
         command = base_command + [input_file.get("path")]
 
-        # Run the command
         with open(output_file.path, "w") as fh:
             process = subprocess.Popen(command, stdout=fh)
             start_time = datetime.datetime.now()
