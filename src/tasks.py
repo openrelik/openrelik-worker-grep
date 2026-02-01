@@ -17,22 +17,19 @@ import subprocess
 from celery import signals
 from celery.utils.log import get_task_logger
 from openrelik_common.logging import Logger
-from .openrelik_worker_common.file_utils import (
+from openrelik_worker_common.file_utils import (
     create_output_file,
     count_file_lines,
     is_disk_image,
 )
-from .openrelik_worker_common.mount_utils import BlockDevice
-from .openrelik_worker_common.task_utils import create_task_result, get_input_files
+from openrelik_worker_common.mount_utils import BlockDevice
+from openrelik_worker_common.task_utils import create_task_result, get_input_files
 
 
 import datetime
 import time
 
 from .app import celery
-
-log_root = Logger()
-logger = log_root.get_logger(__name__, get_task_logger(__name__))
 
 TASK_NAME = "openrelik-worker-grep.tasks.grep"
 
@@ -57,6 +54,9 @@ TASK_METADATA = {
         },
     ],
 }
+
+log_root = Logger()
+logger = log_root.get_logger(__name__, get_task_logger(__name__))
 
 
 @signals.task_prerun.connect
