@@ -14,8 +14,17 @@
 
 import subprocess
 
-from openrelik_worker_common.file_utils import create_output_file, count_file_lines
+from celery import signals
+from celery.utils.log import get_task_logger
+from openrelik_common.logging import Logger
+from openrelik_worker_common.file_utils import (
+    create_output_file,
+    count_file_lines,
+    is_disk_image,
+)
+from openrelik_worker_common.mount_utils import BlockDevice
 from openrelik_worker_common.task_utils import create_task_result, get_input_files
+
 
 import datetime
 import time
@@ -35,8 +44,28 @@ TASK_METADATA = {
             "type": "text",
             "required": True,
         },
+        {
+            "name": "mount_disk_images",
+            "label": "Mount disk images",
+            "description": "If checked, the worker will try to mount disk images and grep the files inside the disk image.",
+            "type": "checkbox",
+            "required": True,
+            "default_value": False,
+        },
     ],
 }
+
+log_root = Logger()
+logger = log_root.get_logger(__name__, get_task_logger(__name__))
+
+
+@signals.task_prerun.connect
+def on_task_prerun(sender, task_id, task, args, kwargs, **_):
+    log_root.bind(
+        task_id=task_id,
+        task_name=task.name,
+        worker_name=TASK_METADATA.get("display_name"),
+    )
 
 
 @celery.task(bind=True, name=TASK_NAME, metadata=TASK_METADATA)
@@ -60,40 +89,67 @@ def command(
     Returns:
         Base64-encoded dictionary containing task results.
     """
+    log_root.bind(workflow_id=workflow_id)
+    logger.debug(f"Starting {TASK_NAME} for workflow {workflow_id}")
+
     input_files = get_input_files(pipe_result, input_files or [])
     output_files = []
-    base_command = ["grep", "-Ei", task_config.get("regex")]
+    base_command = ["grep", "-aEi", task_config.get("regex")]
     base_command_string = " ".join(base_command)
 
+    mount_disk_images = task_config.get("mount_disk_images", False)
+
+    disks_mounted = []
     for input_file in input_files:
-        output_file = create_output_file(
-            output_path, display_name=input_file.get("display_name") + ".grep"
-        )
-        command = base_command + [input_file.get("path")]
+        input_file_path = input_file.get("path")
+        try:
+            if mount_disk_images and is_disk_image(input_file):
+                bd = BlockDevice(input_file_path, min_partition_size=1)
+                bd.setup()
+                mountpoints = bd.mount()
+                disks_mounted.append(bd)
+                base_command.append("-R")
+                for mountpoint in mountpoints:
+                    base_command.append(f"{mountpoint}/")
+                command = base_command
+            else:
+                command = base_command + [input_file.get("path")]
 
-        with open(output_file.path, "w") as fh:
-            process = subprocess.Popen(command, stdout=fh)
-            start_time = datetime.datetime.now()
-            update_interval_s = 3
+            output_file = create_output_file(
+                output_path,
+                display_name=input_file.get("display_name") + ".grep",
+            )
 
-            while process.poll() is None:
-                grep_matches = count_file_lines(output_file.path)
-                duration = datetime.datetime.now() - start_time
-                rate = (
-                    int(grep_matches / duration.total_seconds())
-                    if duration.total_seconds() > 0
-                    else 0
-                )
-                self.send_event(
-                    "task-progress",
-                    data={"extracted_strings": grep_matches, "rate": rate},
-                )
-                time.sleep(update_interval_s)
+            with open(output_file.path, "w") as fh:
+                process = subprocess.Popen(command, stdout=fh)
+                start_time = datetime.datetime.now()
+                update_interval_s = 3
 
-        output_files.append(output_file.to_dict())
+                while process.poll() is None:
+                    grep_matches = count_file_lines(output_file.path)
+                    duration = datetime.datetime.now() - start_time
+                    rate = (
+                        int(grep_matches / duration.total_seconds())
+                        if duration.total_seconds() > 0
+                        else 0
+                    )
+                    self.send_event(
+                        "task-progress",
+                        data={"extracted_strings": grep_matches, "rate": rate},
+                    )
+                    time.sleep(update_interval_s)
+
+            output_files.append(output_file.to_dict())
+        except RuntimeError as e:
+            logger.error("Error openrelik-worker-grep encountered: %s", str(e))
+        finally:
+            for blockdevice in disks_mounted:
+                if blockdevice:
+                    logger.debug(f"Unmounting image {blockdevice.image_path}")
+                    blockdevice.umount()
 
     if not output_files:
-        raise RuntimeError("Grep task yielded no results")
+        logger.info("openrelik-worker-grep task yielded no results!")
 
     return create_task_result(
         output_files=output_files,
